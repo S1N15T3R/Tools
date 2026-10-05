@@ -1,0 +1,33 @@
+# Environment variables and secrets
+.env
+*.env
+.env.*
+!.env.example
+.env.local
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# Output reports
+*.html
+*.md
+!README.md
+!*/README.md
+
+# OS / Editor artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

@@ -1,0 +1,28 @@
+# Environment variables and secrets
+.env
+*.env
+.env.*
+!.env.example
+.env.local
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output reports
+*.html
+*.md
+!README.md
