@@ -10,6 +10,12 @@
 - **Dual Operating Modes:**
   - **🌐 Public Discovery Mode:** Works out of the box with zero platform credentials.
   - **🔒 Authenticated Mode:** Unlocks **exclusive private program invitations**, deeper credential access, and official HackerOne REST API integration.
+- **Dual-Section Reporting:** Output reports are divided into two dedicated sections:
+  1. **🚀 Newly Launched Programs:** Ranked strictly by initial launch / release recency.
+  2. **🔄 Recently Updated Programs:** Ranked strictly by last update timestamp.
+- **Separated Updated Scopes:** In the Recently Updated view, scope changes are isolated into a dedicated callout box, clearly revealing which new assets were added or modified in the latest release.
+- **Strict Scope Validation:** Every program output contains only valid, verified in-scope assets (deduplicated, normalized, with out-of-scope targets and junk removed).
+- **Accurate YesWeHack Launch Dates:** Queries program version history (`/programs/{slug}/versions`) to extract genuine initial launch dates and distinguish them from subsequent policy updates.
 - **🛡️ Anti-Ban & Rate-Limit Safeguards:**
   - **Per-Domain Pacing:** Enforces strict intervals between requests (1.2s on HackerOne/YesWeHack, 2.0s on Bugcrowd).
   - **HTTP 429 Compliance:** Automatically inspects and obeys `Retry-After` headers.

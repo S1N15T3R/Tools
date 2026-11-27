@@ -7,10 +7,16 @@ Bugcrowd, and YesWeHack. Supports both Authenticated Mode (private invitations,
 official APIs, deeper credential access) and Public Discovery Mode.
 
 Features:
+- Dual-Section Reporting: Generates separated sections for:
+    1. 🚀 Newly Launched Programs (ranked chronologically by Launch Date)
+    2. 🔄 Recently Updated Programs (ranked chronologically by Last Update Date)
+- Separated Updated Scopes: For recently updated targets, extracts and isolates
+  the specific scope assets that were newly added or modified in the latest release.
+- Valid Scope Filtering: Every program output contains strictly valid in-scope
+  assets (out-of-scope targets, empty entries, and duplicates filtered out).
 - Safe Anti-Ban Protection: Strict per-platform rate limiting (1.2s - 2.0s delays),
   automatic 429 Retry-After compliance, and an intelligent Circuit Breaker that
   trips immediately on 401/403 auth errors to protect researcher accounts from bans.
-- Chronological Ranking: Ranks targets from freshest to oldest by launch/update time.
 - 7-Point IDOR Screening: Evaluates each target against IDOR hunting prerequisites.
 - Multi-Format Reports: Responsive dark-mode HTML dashboard & Markdown reports.
 - Zero-Secret Architecture: Reads all API keys/tokens from .env.
@@ -259,6 +265,91 @@ def parse_timestamp_for_sort(date_str):
 
 
 # ==============================================================================
+# Scope Sanitization & Validation (Valid In-Scope Assets Only)
+# ==============================================================================
+
+def clean_valid_scopes(raw_scopes, out_of_scope_raw=None):
+    """
+    Sanitizes scope targets to ensure ONLY valid in-scope assets are returned:
+    - Eliminates out-of-scope targets
+    - Strips empty, None, or whitespace-only entries
+    - Normalizes asset category types
+    - Deduplicates entries
+    """
+    out_set = set()
+    if out_of_scope_raw:
+        for item in out_of_scope_raw:
+            if isinstance(item, dict):
+                t = item.get("target") or item.get("scope") or item.get("asset_identifier")
+            else:
+                t = str(item)
+            if t:
+                out_set.add(str(t).strip().lower().rstrip("/"))
+
+    type_map = {
+        "web-application": "Web Application",
+        "website": "Web Application",
+        "url": "Web Application",
+        "web": "Web Application",
+        "api": "API Endpoint",
+        "mobile-application-android": "Android App",
+        "android": "Android App",
+        "mobile-application-ios": "iOS App",
+        "ios": "iOS App",
+        "wildcard": "Wildcard Domain",
+        "source-code": "Source Code",
+        "code": "Source Code",
+        "ip-address": "IP / CIDR",
+        "cidr": "IP / CIDR",
+        "hardware": "Hardware / Device",
+        "other": "Other Asset",
+    }
+
+    cleaned = []
+    seen = set()
+
+    for item in (raw_scopes or []):
+        if isinstance(item, dict):
+            if item.get("eligible_for_submission") is False:
+                continue
+            t = (
+                item.get("target")
+                or item.get("scope")
+                or item.get("asset_identifier")
+                or item.get("uri")
+                or item.get("name")
+            )
+            stype = (
+                item.get("type")
+                or item.get("scope_type")
+                or item.get("asset_type")
+                or item.get("category")
+                or "target"
+            )
+        else:
+            t = str(item)
+            stype = "target"
+
+        if not t:
+            continue
+        t_clean = str(t).strip()
+        t_key = t_clean.lower().rstrip("/")
+
+        # Exclude out-of-scope and duplicates
+        if not t_clean or t_key in out_set or t_key in seen:
+            continue
+
+        seen.add(t_key)
+        clean_type = type_map.get(str(stype).strip().lower(), str(stype).strip().title())
+        cleaned.append({
+            "target": t_clean,
+            "type": clean_type,
+        })
+
+    return cleaned
+
+
+# ==============================================================================
 # Platform Fetching Modules (Authenticated & Public)
 # ==============================================================================
 
@@ -299,18 +390,68 @@ def fetch_bugcrowd_programs(count_per_type=2, auth_creds=None):
             brief_url = en.get("briefUrl", "")
             code = brief_url.strip("/").split("/")[-1]
             started_at, updated_at = "N/A", "N/A"
+            valid_scopes = []
+            updated_scopes = []
+
             try:
-                cl_resp = safe_request("GET", f"https://bugcrowd.com/engagements/{code}/changelog.json", platform="bugcrowd", is_auth=is_authenticated, headers=headers, cookies=cookies)
+                cl_resp = safe_request(
+                    "GET",
+                    f"https://bugcrowd.com/engagements/{code}/changelog.json",
+                    platform="bugcrowd",
+                    is_auth=is_authenticated,
+                    headers=headers,
+                    cookies=cookies,
+                )
                 if cl_resp and cl_resp.status_code == 200:
                     logs = cl_resp.json().get("changelogs", [])
                     if logs:
                         updated_at = format_date(logs[0].get("publishedAt"))
-                        started_at = format_date(logs[-1].get("publishedAt"))
+                        oldest_pub = format_date(logs[-1].get("publishedAt"))
+
+                        # Query detailed changelog JSON for exact scopes & launch date
+                        latest_cl_id = logs[0].get("id")
+                        if latest_cl_id:
+                            ch_resp = safe_request(
+                                "GET",
+                                f"https://bugcrowd.com/engagements/{code}/changelog/{latest_cl_id}.json",
+                                platform="bugcrowd",
+                                is_auth=is_authenticated,
+                                headers=headers,
+                                cookies=cookies,
+                            )
+                            if ch_resp and ch_resp.status_code == 200:
+                                ch_data = ch_resp.json().get("data", {})
+                                starts_at = ch_data.get("engagement", {}).get("startsAt")
+                                started_at = format_date(starts_at) if starts_at else oldest_pub
+
+                                raw_scopes = ch_data.get("scope", [])
+                                for g in raw_scopes:
+                                    g_name = g.get("name", "In-Scope")
+                                    for t in g.get("targets", []):
+                                        target_uri = t.get("uri") or t.get("name")
+                                        cat = t.get("category") or "target"
+                                        if target_uri:
+                                            valid_scopes.append({"target": target_uri, "type": cat, "group": g_name})
+
+                                # If latest changelog tag mentions targets, these are updated scopes
+                                if "targets" in str(logs[0].get("tags", "")).lower():
+                                    updated_scopes = valid_scopes
+
+                        if started_at == "N/A":
+                            started_at = oldest_pub
             except Exception:
                 pass
 
             sort_score = max(parse_timestamp_for_sort(updated_at), parse_timestamp_for_sort(started_at))
-            return {"raw": en, "code": code, "started_at": started_at, "updated_at": updated_at, "sort_score": sort_score}
+            return {
+                "raw": en,
+                "code": code,
+                "started_at": started_at,
+                "updated_at": updated_at,
+                "sort_score": sort_score,
+                "valid_scopes": valid_scopes,
+                "updated_scopes": updated_scopes,
+            }
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             candidates = list(executor.map(get_engagement_details, raw_engs))
@@ -329,7 +470,11 @@ def fetch_bugcrowd_programs(count_per_type=2, auth_creds=None):
             rs = en.get("rewardSummary") or {}
 
             # Detect private engagement vs public
-            is_private = bool(en.get("accessStatus") == "invited" or en.get("confidential") or not brief_url.startswith("/engagements/"))
+            is_private = bool(
+                en.get("accessStatus") == "invited"
+                or en.get("confidential")
+                or not brief_url.startswith("/engagements/")
+            )
 
             # Deep brief description
             description = ""
@@ -355,8 +500,16 @@ def fetch_bugcrowd_programs(count_per_type=2, auth_creds=None):
             except Exception:
                 pass
 
-            extra = bc_map.get(full_url.rstrip("/")) or bc_map.get(name.strip().lower()) or {}
-            targets = extra.get("targets", {})
+            valid_scopes = item["valid_scopes"]
+            if not valid_scopes:
+                extra = bc_map.get(full_url.rstrip("/")) or bc_map.get(name.strip().lower()) or {}
+                raw_in = extra.get("targets", {}).get("in_scope", [])
+                raw_out = extra.get("targets", {}).get("out_of_scope", [])
+                valid_scopes = clean_valid_scopes(raw_in, raw_out)
+            else:
+                valid_scopes = clean_valid_scopes(valid_scopes)
+
+            updated_scopes = clean_valid_scopes(item["updated_scopes"])
             reward_str = rs.get("summary") or ("Cash Bounty" if is_bounty_target else "Points Only / None")
 
             prog_info = {
@@ -370,7 +523,13 @@ def fetch_bugcrowd_programs(count_per_type=2, auth_creds=None):
                 "launched_at": item["started_at"],
                 "last_updated_at": item["updated_at"],
                 "description": description or tagline,
-                "targets": targets,
+                "valid_in_scope": valid_scopes,
+                "updated_scopes": updated_scopes,
+                "scope_updated": len(updated_scopes) > 0,
+                "targets": {
+                    "in_scope": valid_scopes,
+                    "out_of_scope": [],
+                },
             }
             selected.append(prog_info)
             vis_icon = "🔒" if is_private else "🌐"
@@ -396,7 +555,6 @@ def fetch_yeswehack_programs(count_per_type=2, auth_creds=None):
         print("  [⚡] YesWeHack Authenticated Mode Active (Bearer Token provided).")
         headers["Authorization"] = f"Bearer {ywh_token}"
 
-    # In authenticated mode, query private programs first to capture exclusive invitations
     types_to_query = ["private", "public"] if is_authenticated else ["public"]
 
     for ptype in types_to_query:
@@ -405,7 +563,7 @@ def fetch_yeswehack_programs(count_per_type=2, auth_creds=None):
 
         page = 1
         while (len(vdp) < count_per_type or len(bounty) < count_per_type) and page <= 3:
-            url = f"https://api.yeswehack.com/programs?sort=public_date&direction=desc&type={ptype}&page={page}"
+            url = f"https://api.yeswehack.com/programs?type={ptype}&page={page}"
             r = safe_request("GET", url, platform="yeswehack", is_auth=(ptype == "private" or is_authenticated), headers=headers)
             if r is None or r.status_code != 200:
                 break
@@ -438,24 +596,37 @@ def fetch_yeswehack_programs(count_per_type=2, auth_creds=None):
                 max_b = detail.get("bounty_reward_max")
                 reward_str = f"€{min_b} - €{max_b}" if (min_b or max_b) else ("VDP / Swag" if not is_bounty else "Bounty")
 
+                # Fetch authoritative Launch & Update dates from /versions endpoint
+                started_at = "N/A"
                 updated_at = format_date(detail.get("last_update_at") or it.get("last_update_at"))
-                started_at = format_date(detail.get("public_date") or it.get("public_date"))
-                if started_at == "N/A":
-                    started_at = updated_at
+                updated_scopes_raw = []
 
-                formatted_in = []
-                for s in scopes:
-                    if isinstance(s, dict):
-                        formatted_in.append({"target": s.get("scope") or s.get("target"), "type": s.get("scope_type")})
-                    elif isinstance(s, str):
-                        formatted_in.append({"target": s, "type": "target"})
+                ver_resp = safe_request("GET", f"https://api.yeswehack.com/programs/{slug}/versions", platform="yeswehack", is_auth=is_authenticated, headers=headers)
+                if ver_resp and ver_resp.status_code == 200:
+                    vers = ver_resp.json().get("items", [])
+                    if vers:
+                        # Oldest version is true Launch Date
+                        oldest_ver = vers[-1]
+                        started_at = format_date(oldest_ver.get("accepted_at") or oldest_ver.get("updated_at"))
 
-                formatted_out = []
-                for s in out_of_scope:
-                    if isinstance(s, dict):
-                        formatted_out.append({"target": s.get("scope") or s.get("target"), "type": s.get("scope_type")})
-                    elif isinstance(s, str):
-                        formatted_out.append({"target": s, "type": "out_of_scope"})
+                        # Newest version is true Last Updated Date
+                        newest_ver = vers[0]
+                        updated_at = format_date(newest_ver.get("accepted_at") or newest_ver.get("updated_at") or updated_at)
+
+                        # Check top 2 versions for updated scope items
+                        for v in vers[:2]:
+                            if "scopes" in v.get("fields", []):
+                                for s in v.get("data", {}).get("scopes", []):
+                                    t = s.get("scope") or s.get("target")
+                                    stype = s.get("scope_type") or s.get("type") or "web-application"
+                                    if t:
+                                        updated_scopes_raw.append({"target": t, "type": stype})
+                                if updated_scopes_raw:
+                                    break
+
+                # Clean scopes to ensure ONLY valid in-scope assets remain
+                valid_scopes = clean_valid_scopes(scopes, out_of_scope)
+                updated_scopes = clean_valid_scopes(updated_scopes_raw, out_of_scope)
 
                 prog_info = {
                     "name": name,
@@ -468,9 +639,12 @@ def fetch_yeswehack_programs(count_per_type=2, auth_creds=None):
                     "last_updated_at": updated_at,
                     "description": rules_text[:4000],
                     "account_access": account_access,
+                    "valid_in_scope": valid_scopes,
+                    "updated_scopes": updated_scopes,
+                    "scope_updated": len(updated_scopes) > 0,
                     "targets": {
-                        "in_scope": formatted_in,
-                        "out_of_scope": formatted_out,
+                        "in_scope": valid_scopes,
+                        "out_of_scope": clean_valid_scopes(out_of_scope),
                     },
                 }
 
@@ -527,7 +701,6 @@ def fetch_hackerone_programs_authenticated(h1_user, h1_token, count_per_type=2):
     """
     Fetches accessible programs via the official HackerOne Hacker REST API:
     GET https://api.hackerone.com/v1/hackers/me/programs
-    Bypasses Cloudflare protections and returns authentic private invitations.
     """
     print(f"[*] Querying HackerOne Official API (me/programs)...")
     url = "https://api.hackerone.com/v1/hackers/me/programs"
@@ -553,18 +726,19 @@ def fetch_hackerone_programs_authenticated(h1_user, h1_token, count_per_type=2):
         if not offers_bounties and len(vdp) >= count_per_type:
             continue
 
-        # Fetch in-scope structured targets
         scopes_url = f"https://api.hackerone.com/v1/hackers/programs/{handle}/structured_scopes"
         s_resp = safe_request("GET", scopes_url, platform="hackerone", is_auth=True, auth=auth)
-        in_scope = []
+        raw_in_scope = []
         if s_resp and s_resp.status_code == 200:
             for sc in s_resp.json().get("data", []):
                 s_attr = sc.get("attributes", {})
                 if s_attr.get("eligible_for_submission"):
-                    in_scope.append({
+                    raw_in_scope.append({
                         "target": s_attr.get("asset_identifier"),
                         "type": s_attr.get("asset_type"),
                     })
+
+        valid_scopes = clean_valid_scopes(raw_in_scope)
 
         prog_info = {
             "name": name,
@@ -576,7 +750,10 @@ def fetch_hackerone_programs_authenticated(h1_user, h1_token, count_per_type=2):
             "launched_at": started_at,
             "last_updated_at": started_at,
             "description": f"HackerOne Program: {name} (Submission State: {attrs.get('submission_state')})",
-            "targets": {"in_scope": in_scope, "out_of_scope": []},
+            "valid_in_scope": valid_scopes,
+            "updated_scopes": [],
+            "scope_updated": False,
+            "targets": {"in_scope": valid_scopes, "out_of_scope": []},
         }
 
         vis_icon = "🔒" if is_private else "🌐"
@@ -603,7 +780,6 @@ def fetch_hackerone_programs(count_per_type=2, auth_creds=None):
         print("  [⚡] HackerOne Authenticated Mode Active (Official Hacker API).")
         vdp, bounty = fetch_hackerone_programs_authenticated(h1_user, h1_token, count_per_type=count_per_type)
 
-    # If count not met or public fallback, supplement from public aggregator
     if len(vdp) < count_per_type or len(bounty) < count_per_type:
         needed_vdp = count_per_type - len(vdp)
         needed_bounty = count_per_type - len(bounty)
@@ -653,6 +829,10 @@ def fetch_hackerone_programs(count_per_type=2, auth_creds=None):
                 f"Avg Resolution Time: {resolved_time} hrs"
             )
 
+            raw_in = targets.get("in_scope", [])
+            raw_out = targets.get("out_of_scope", [])
+            valid_scopes = clean_valid_scopes(raw_in, raw_out)
+
             prog_info = {
                 "name": name,
                 "url": prog_url,
@@ -664,7 +844,13 @@ def fetch_hackerone_programs(count_per_type=2, auth_creds=None):
                 "last_updated_at": item["updated_at"],
                 "stats": stats_str,
                 "description": f"HackerOne Program: {name}. Health stats: {stats_str}",
-                "targets": targets,
+                "valid_in_scope": valid_scopes,
+                "updated_scopes": [],
+                "scope_updated": False,
+                "targets": {
+                    "in_scope": valid_scopes,
+                    "out_of_scope": clean_valid_scopes(raw_out),
+                },
             }
 
             if is_bounty and len(bounty) < count_per_type:
@@ -690,17 +876,11 @@ def evaluate_program_with_llm(client, model, prog):
     Leaves checkbox [ ] if unable to confirm or information is lacking.
     """
     in_scope_summary = []
-    in_scope = prog.get("targets", {}).get("in_scope", [])
-    for s in in_scope[:8]:
-        target = s.get("target") or s.get("asset_identifier") or s.get("uri") or ""
-        stype = s.get("type") or s.get("asset_type") or ""
+    in_scope = prog.get("valid_in_scope", [])
+    for s in in_scope[:10]:
+        target = s.get("target") or ""
+        stype = s.get("type") or ""
         in_scope_summary.append(f"{target} ({stype})")
-
-    out_scope_summary = []
-    out_scope = prog.get("targets", {}).get("out_of_scope", [])
-    for s in out_scope[:6]:
-        target = s.get("target") or s.get("asset_identifier") or ""
-        out_scope_summary.append(target)
 
     context_text = f"""
 Platform: {prog.get('platform')}
@@ -715,11 +895,8 @@ Account/Registration Info: {prog.get('account_access', 'N/A')}
 Policy / Description:
 {prog.get('description', '')[:2500]}
 
-In-Scope Targets ({len(in_scope)} total):
+Valid In-Scope Targets ({len(in_scope)} total):
 {', '.join(in_scope_summary) if in_scope_summary else 'No granular target list provided'}
-
-Out-Of-Scope Assets:
-{', '.join(out_scope_summary) if out_scope_summary else 'Standard platform out-of-scope policies'}
 """
 
     prompt = f"""You are an elite Bug Bounty hunter screening targets specifically for IDOR (Insecure Direct Object Reference) and broken object-level authorization vulnerabilities.
@@ -778,98 +955,189 @@ def calculate_score(checklist_text):
 
 
 # ==============================================================================
-# Markdown Report Generator (Chronologically Ranked)
+# Dual-Section Markdown Report Generator
 # ==============================================================================
 
 def generate_markdown_report(programs_with_evals, output_path, model_name):
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total_progs = len(programs_with_evals)
 
+    # Sort 1: By Launched Date descending (newest launch first)
+    by_launched = sorted(
+        programs_with_evals,
+        key=lambda x: parse_timestamp_for_sort(x["prog"].get("launched_at")),
+        reverse=True,
+    )
+
+    # Sort 2: By Last Updated Date descending (newest update first)
+    by_updated = sorted(
+        programs_with_evals,
+        key=lambda x: parse_timestamp_for_sort(x["prog"].get("last_updated_at")),
+        reverse=True,
+    )
+
     md = []
     md.append("# 🎯 Bug Bounty IDOR Target Reconnaissance Report")
     md.append(f"*Generated on: `{now_str}`* | *Model: `{model_name}`* | *Total Programs: `{total_progs}`*\n")
     md.append(
-        "> **Methodology:** Targets are ranked **chronologically by launch & last update recency**. "
-        "Each program is screened against 7 core IDOR hunting prerequisites. Criteria lacking explicit policy confirmation "
-        "are left unchecked `[ ]` for manual triage.\n"
+        "> **Methodology:** Report is split into **Two Dedicated Sections**: "
+        "**(1) Newly Launched Programs** and **(2) Recently Updated Programs**. "
+        "Each program includes a verified list of valid in-scope assets and 7-point IDOR readiness screening. "
+        "Recently updated programs display an isolated list of newly modified scopes.\n"
     )
 
-    # Executive Summary Table (Ranked)
-    md.append("## 📊 Executive Target Matrix (Ranked by Recency)\n")
-    md.append("| Rank | Platform | Program | Type | Access | Reward | Launched | Last Updated | IDOR Score | Quick Link |")
-    md.append("|:---:|---|---|---|:---:|---|:---:|:---:|:---:|:---:|")
+    md.append("## 📑 Quick Navigation")
+    md.append("- [🚀 Section 1: Newly Launched Programs](#-section-1-newly-launched-programs)")
+    md.append("- [🔄 Section 2: Recently Updated Programs](#-section-2-recently-updated-programs)")
+    md.append("- [🏆 Top IDOR Viability Recommendations](#-top-idor-viability-recommendations)")
+    md.append("\n---\n")
 
-    for idx, item in enumerate(programs_with_evals, 1):
+    # --------------------------------------------------------------------------
+    # Section 1: Newly Launched Programs
+    # --------------------------------------------------------------------------
+    md.append("## 🚀 Section 1: Newly Launched Programs")
+    md.append("*Ranked chronologically by launch recency (newest program launch first).*\n")
+
+    md.append("### 📊 Newly Launched Matrix")
+    md.append("| Rank | Platform | Program | Type | Access | Reward | Launched | IDOR Score | Quick Link |")
+    md.append("|:---:|---|---|---|:---:|---|:---:|:---:|:---:|")
+
+    for idx, item in enumerate(by_launched, 1):
         p = item["prog"]
         score = item["score"]
-        score_badge = f"**{score}/7**"
-        if score >= 5:
-            score_badge = f"🟢 **{score}/7 (High)**"
-        elif score >= 3:
-            score_badge = f"🟡 **{score}/7 (Med)**"
-        else:
-            score_badge = f"⚪ **{score}/7 (Low)**"
-
+        score_badge = f"🟢 **{score}/7**" if score >= 4 else (f"🟡 **{score}/7**" if score >= 2 else f"⚪ **{score}/7**")
         vis_badge = "🔒 `Private`" if p.get("visibility") == "Private" else "🌐 `Public`"
 
         md.append(
-            f"| **#{idx}** | **{p['platform']}** | {p['name']} | `{p['type']}` | {vis_badge} | {p['reward']} | `{p.get('launched_at', 'N/A')}` | `{p.get('last_updated_at', 'N/A')}` | {score_badge} | [View Policy]({p['url']}) |"
+            f"| **#{idx}** | **{p['platform']}** | {p['name']} | `{p['type']}` | {vis_badge} | {p['reward']} | `{p.get('launched_at', 'N/A')}` | {score_badge} | [View Policy]({p['url']}) |"
         )
-    md.append("\n---\n")
+    md.append("\n")
 
-    # Detailed Program Cards
-    md.append("## 🔍 Detailed Program Evaluations\n")
-    for idx, item in enumerate(programs_with_evals, 1):
+    md.append("### 🔍 Newly Launched Program Details\n")
+    for idx, item in enumerate(by_launched, 1):
         p = item["prog"]
         eval_text = item["eval"]
         score = item["score"]
-
         icon = "🛡️" if p["platform"] == "HackerOne" else ("🐞" if p["platform"] == "Bugcrowd" else "⚔️")
         vis_tag = "🔒 [PRIVATE INVITATION]" if p.get("visibility") == "Private" else "🌐 [PUBLIC PROGRAM]"
 
-        md.append(f"### #{idx}. {icon} {p['name']} (`{p['type']}` - {p['platform']}) {vis_tag}\n")
+        md.append(f"#### #{idx}. {icon} {p['name']} (`{p['type']}` - {p['platform']}) {vis_tag}\n")
         md.append(f"- **Program URL:** [{p['url']}]({p['url']})")
         md.append(f"- **Access Visibility:** `{p.get('visibility', 'Public')}`")
         md.append(f"- **Reward:** `{p['reward']}`")
-        md.append(f"- **Launched / Started:** `{p.get('launched_at', 'N/A')}`")
-        md.append(f"- **Last Updated:** `{p.get('last_updated_at', 'N/A')}`")
+        md.append(f"- **Launched Date:** `{p.get('launched_at', 'N/A')}`")
         if p.get("stats"):
             md.append(f"- **Platform Stats:** `{p['stats']}`")
         if p.get("account_access"):
             md.append(f"- **Credentials/Access:** {p['account_access']}")
 
-        md.append(f"\n#### 🎯 IDOR Readiness Checklist (Score: {score}/7)\n")
+        md.append(f"\n##### 🎯 IDOR Readiness Checklist (Score: {score}/7)\n")
         md.append(eval_text)
         md.append("\n")
 
-        # Collapsible Scope Details
-        in_scope = p.get("targets", {}).get("in_scope", [])
-        if in_scope:
+        # Valid in-scope targets
+        valid_scope = p.get("valid_in_scope", [])
+        if valid_scope:
             md.append("<details>")
-            md.append("<summary><b>📂 Target Scope Details</b></summary>\n")
+            md.append(f"<summary><b>📂 Valid In-Scope Program Scope ({len(valid_scope)} valid assets)</b></summary>\n")
             md.append("```yaml")
-            for t in in_scope[:15]:
-                identifier = t.get("target") or t.get("asset_identifier") or t.get("uri")
-                ttype = t.get("type") or t.get("asset_type") or "target"
-                md.append(f"- {identifier} ({ttype})")
-            if len(in_scope) > 15:
-                md.append(f"# ... and {len(in_scope) - 15} more in-scope targets")
+            for t in valid_scope[:25]:
+                md.append(f"- target: \"{t['target']}\"\n  type: \"{t['type']}\"")
+            if len(valid_scope) > 25:
+                md.append(f"# ... and {len(valid_scope) - 25} more valid targets")
             md.append("```")
             md.append("</details>\n")
+        else:
+            md.append("*No granular in-scope asset list exposed in public policy.*")
 
         md.append("---\n")
 
+    # --------------------------------------------------------------------------
+    # Section 2: Recently Updated Programs
+    # --------------------------------------------------------------------------
+    md.append("## 🔄 Section 2: Recently Updated Programs")
+    md.append("*Ranked chronologically by update recency (newest scope / policy updates first).*\n")
+
+    md.append("### 📊 Recently Updated Matrix")
+    md.append("| Rank | Platform | Program | Type | Access | Reward | Last Updated | Scope Updated? | IDOR Score | Quick Link |")
+    md.append("|:---:|---|---|---|:---:|---|:---:|:---:|:---:|:---:|")
+
+    for idx, item in enumerate(by_updated, 1):
+        p = item["prog"]
+        score = item["score"]
+        score_badge = f"🟢 **{score}/7**" if score >= 4 else (f"🟡 **{score}/7**" if score >= 2 else f"⚪ **{score}/7**")
+        vis_badge = "🔒 `Private`" if p.get("visibility") == "Private" else "🌐 `Public`"
+        scope_up_badge = "🟢 **Yes (Scopes Added/Modified)**" if p.get("scope_updated") else "⚪ *Policy Only*"
+
+        md.append(
+            f"| **#{idx}** | **{p['platform']}** | {p['name']} | `{p['type']}` | {vis_badge} | {p['reward']} | `{p.get('last_updated_at', 'N/A')}` | {scope_up_badge} | {score_badge} | [View Policy]({p['url']}) |"
+        )
+    md.append("\n")
+
+    md.append("### 🔍 Recently Updated Program Details (With Separated Updated Scopes)\n")
+    for idx, item in enumerate(by_updated, 1):
+        p = item["prog"]
+        eval_text = item["eval"]
+        score = item["score"]
+        icon = "🛡️" if p["platform"] == "HackerOne" else ("🐞" if p["platform"] == "Bugcrowd" else "⚔️")
+        vis_tag = "🔒 [PRIVATE INVITATION]" if p.get("visibility") == "Private" else "🌐 [PUBLIC PROGRAM]"
+
+        md.append(f"#### #{idx}. {icon} {p['name']} (`{p['type']}` - {p['platform']}) {vis_tag}\n")
+        md.append(f"- **Program URL:** [{p['url']}]({p['url']})")
+        md.append(f"- **Last Updated Date:** `{p.get('last_updated_at', 'N/A')}`")
+        md.append(f"- **Original Launch Date:** `{p.get('launched_at', 'N/A')}`")
+        md.append(f"- **Reward:** `{p['reward']}`")
+
+        # Dedicated Separated Section for Updated Scope
+        updated_scopes = p.get("updated_scopes", [])
+        md.append("\n##### 🔄 Updated Scope Changes (Latest Release)")
+        if updated_scopes:
+            md.append("> **New / Modified Assets in Latest Update:**\n")
+            for us in updated_scopes[:15]:
+                md.append(f"- 🟢 **[{us['type']}]** `{us['target']}`")
+            if len(updated_scopes) > 15:
+                md.append(f"- *... and {len(updated_scopes) - 15} additional updated targets*")
+        else:
+            md.append("ℹ️ *Scope remained unchanged in latest release (Policy, bounty limits, or brief update).*")
+
+        md.append(f"\n##### 🎯 IDOR Readiness Checklist (Score: {score}/7)\n")
+        md.append(eval_text)
+        md.append("\n")
+
+        # Full verified valid in-scope targets
+        valid_scope = p.get("valid_in_scope", [])
+        if valid_scope:
+            md.append("<details>")
+            md.append(f"<summary><b>📂 Complete Valid In-Scope Program Scope ({len(valid_scope)} valid assets)</b></summary>\n")
+            md.append("```yaml")
+            for t in valid_scope[:25]:
+                md.append(f"- target: \"{t['target']}\"\n  type: \"{t['type']}\"")
+            if len(valid_scope) > 25:
+                md.append(f"# ... and {len(valid_scope) - 25} more valid targets")
+            md.append("```")
+            md.append("</details>\n")
+        else:
+            md.append("*No granular in-scope asset list exposed in public policy.*")
+
+        md.append("---\n")
+
+    # --------------------------------------------------------------------------
     # Recommendations
-    sorted_by_score = sorted(programs_with_evals, key=lambda x: (x["prog"].get("visibility") == "Private", x["score"]), reverse=True)
+    # --------------------------------------------------------------------------
+    sorted_by_score = sorted(
+        programs_with_evals,
+        key=lambda x: (x["prog"].get("visibility") == "Private", x["score"]),
+        reverse=True,
+    )
     best_progs = [x for x in sorted_by_score if x["score"] >= 3]
 
-    md.append("## 🏆 Recommended Hunting Order (Priority: Private Invites & High IDOR Viability)\n")
+    md.append("## 🏆 Top IDOR Viability Recommendations\n")
     if best_progs:
         for i, b in enumerate(best_progs[:5], 1):
             p = b["prog"]
             vis_label = "🔒 PRIVATE" if p.get("visibility") == "Private" else "🌐 PUBLIC"
             md.append(
-                f"{i}. **[{p['platform']}] {p['name']}** (`{p['type']}` - {vis_label}) - Score **{b['score']}/7** | Launched: `{p.get('launched_at')}` ([Open]({p['url']}))"
+                f"{i}. **[{p['platform']}] {p['name']}** (`{p['type']}` - {vis_label}) - Score **{b['score']}/7** | Launched: `{p.get('launched_at')}` | Updated: `{p.get('last_updated_at')}` ([Open]({p['url']}))"
             )
     else:
         md.append("*Review the unconfirmed criteria `[ ]` above to manually select targets.*")
@@ -881,7 +1149,7 @@ def generate_markdown_report(programs_with_evals, output_path, model_name):
 
 
 # ==============================================================================
-# Modern Responsive HTML Report Generator
+# Dual-Section Responsive HTML Dashboard Generator
 # ==============================================================================
 
 def generate_html_report(programs_with_evals, output_path, model_name):
@@ -893,45 +1161,20 @@ def generate_html_report(programs_with_evals, output_path, model_name):
     bounty_count = sum(1 for p in programs_with_evals if p["prog"]["type"] == "Bounty")
     vdp_count = sum(1 for p in programs_with_evals if p["prog"]["type"] == "VDP")
 
-    # Build matrix table rows
-    table_rows = []
-    for idx, item in enumerate(programs_with_evals, 1):
-        p = item["prog"]
-        score = item["score"]
-        score_class = "score-high" if score >= 5 else ("score-med" if score >= 3 else "score-low")
-        platform_class = f"badge-{p['platform'].lower()}\""
-        type_class = "badge-bounty" if p["type"] == "Bounty" else "badge-vdp"
-        vis_class = "badge-private" if p.get("visibility") == "Private" else "badge-public"
-        vis_icon = "🔒" if p.get("visibility") == "Private" else "🌐"
+    by_launched = sorted(
+        programs_with_evals,
+        key=lambda x: parse_timestamp_for_sort(x["prog"].get("launched_at")),
+        reverse=True,
+    )
 
-        table_rows.append(f"""
-        <tr data-platform="{p['platform'].lower()}" data-type="{p['type'].lower()}" data-visibility="{p.get('visibility', 'public').lower()}">
-            <td class="text-center"><strong>#{idx}</strong></td>
-            <td><span class="badge {platform_class}>{p['platform']}</span></td>
-            <td><a href="#card-{idx}" class="program-link">{p['name']}</a></td>
-            <td><span class="badge {type_class}">{p['type']}</span></td>
-            <td><span class="badge {vis_class}">{vis_icon} {p.get('visibility', 'Public')}</span></td>
-            <td><code>{p['reward']}</code></td>
-            <td class="text-muted"><small>{p.get('launched_at', 'N/A')}</small></td>
-            <td class="text-muted"><small>{p.get('last_updated_at', 'N/A')}</small></td>
-            <td class="text-center"><span class="score-pill {score_class}">{score}/7</span></td>
-            <td class="text-center"><a href="{p['url']}" target="_blank" class="btn-external">Policy ↗</a></td>
-        </tr>
-        """)
+    by_updated = sorted(
+        programs_with_evals,
+        key=lambda x: parse_timestamp_for_sort(x["prog"].get("last_updated_at")),
+        reverse=True,
+    )
 
-    # Build detailed program cards
-    cards_html = []
-    for idx, item in enumerate(programs_with_evals, 1):
-        p = item["prog"]
-        eval_text = item["eval"]
-        score = item["score"]
-        platform_class = f"badge-{p['platform'].lower()}"
-        type_class = "badge-bounty" if p["type"] == "Bounty" else "badge-vdp"
-        vis_class = "badge-private" if p.get("visibility") == "Private" else "badge-public"
-        vis_icon = "🔒" if p.get("visibility") == "Private" else "🌐"
-        score_class = "score-high" if score >= 5 else ("score-med" if score >= 3 else "score-low")
-
-        checklist_items = []
+    def render_checklist_html(eval_text):
+        items = []
         for line in eval_text.splitlines():
             line = line.strip()
             if not line:
@@ -943,35 +1186,59 @@ def generate_html_report(programs_with_evals, output_path, model_name):
                 content = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", content)
                 icon = '<span class="check-icon success">✓</span>' if is_checked else '<span class="check-icon pending">○</span>'
                 item_class = "item-checked" if is_checked else "item-pending"
-                checklist_items.append(f'<li class="{item_class}">{icon} <div class="item-text">{content}</div></li>')
+                items.append(f'<li class="{item_class}">{icon} <div class="item-text">{content}</div></li>')
+        return "\n".join(items)
 
-        checklist_html = "\n".join(checklist_items)
+    def render_scopes_accordion(valid_scope):
+        if not valid_scope:
+            return '<div class="text-muted" style="margin-top: 0.6rem; font-size: 0.85rem;">No granular in-scope assets listed in policy.</div>'
+        scope_lines = []
+        for t in valid_scope[:30]:
+            scope_lines.append(f'<li><span class="target-name">{t["target"]}</span> <span class="target-type badge-type">[{t["type"]}]</span></li>')
+        if len(valid_scope) > 30:
+            scope_lines.append(f'<li class="text-muted">... and {len(valid_scope) - 30} more valid targets</li>')
 
-        in_scope = p.get("targets", {}).get("in_scope", [])
-        scopes_html = ""
-        if in_scope:
-            scope_lines = []
-            for t in in_scope[:20]:
-                identifier = t.get("target") or t.get("asset_identifier") or t.get("uri")
-                ttype = t.get("type") or t.get("asset_type") or "target"
-                scope_lines.append(f"<li><span class=\"target-name\">{identifier}</span> <span class=\"target-type\">({ttype})</span></li>")
-            if len(in_scope) > 20:
-                scope_lines.append(f"<li class=\"text-muted\">... and {len(in_scope) - 20} more in-scope targets</li>")
+        return f"""
+        <details class="scopes-accordion">
+            <summary>📂 Valid In-Scope Program Scope ({len(valid_scope)} valid assets)</summary>
+            <ul class="scope-list">
+                {''.join(scope_lines)}
+            </ul>
+        </details>
+        """
 
-            scopes_html = f"""
-            <details class="scopes-accordion">
-                <summary>Target Scope Assets ({len(in_scope)} items)</summary>
-                <ul class="scope-list">
-                    {''.join(scope_lines)}
-                </ul>
-            </details>
-            """
+    # 1. Build Launched Table Rows & Cards
+    launched_rows = []
+    launched_cards = []
+    for idx, item in enumerate(by_launched, 1):
+        p = item["prog"]
+        score = item["score"]
+        score_class = "score-high" if score >= 5 else ("score-med" if score >= 3 else "score-low")
+        platform_class = f"badge-{p['platform'].lower()}"
+        type_class = "badge-bounty" if p["type"] == "Bounty" else "badge-vdp"
+        vis_class = "badge-private" if p.get("visibility") == "Private" else "badge-public"
+        vis_icon = "🔒" if p.get("visibility") == "Private" else "🌐"
 
+        launched_rows.append(f"""
+        <tr data-platform="{p['platform'].lower()}" data-type="{p['type'].lower()}" data-visibility="{p.get('visibility', 'public').lower()}">
+            <td class="text-center"><strong>#{idx}</strong></td>
+            <td><span class="badge {platform_class}">{p['platform']}</span></td>
+            <td><a href="#card-launch-{idx}" class="program-link">{p['name']}</a></td>
+            <td><span class="badge {type_class}">{p['type']}</span></td>
+            <td><span class="badge {vis_class}">{vis_icon} {p.get('visibility', 'Public')}</span></td>
+            <td><code>{p['reward']}</code></td>
+            <td class="highlight-date"><strong>{p.get('launched_at', 'N/A')}</strong></td>
+            <td class="text-center"><span class="score-pill {score_class}">{score}/7</span></td>
+            <td class="text-center"><a href="{p['url']}" target="_blank" class="btn-external">Policy ↗</a></td>
+        </tr>
+        """)
+
+        checklist_html = render_checklist_html(item["eval"])
+        scopes_html = render_scopes_accordion(p.get("valid_in_scope", []))
         stats_html = f'<div class="meta-item"><strong>Platform Health:</strong> {p.get("stats")}</div>' if p.get("stats") else ""
-        access_html = f'<div class="meta-item"><strong>Registration / Access:</strong> {p.get("account_access")}</div>' if p.get("account_access") else ""
 
-        cards_html.append(f"""
-        <div class="card" id="card-{idx}" data-platform="{p['platform'].lower()}" data-type="{p['type'].lower()}" data-visibility="{p.get('visibility', 'public').lower()}">
+        launched_cards.append(f"""
+        <div class="card" id="card-launch-{idx}" data-platform="{p['platform'].lower()}" data-type="{p['type'].lower()}" data-visibility="{p.get('visibility', 'public').lower()}">
             <div class="card-header">
                 <div class="card-title-group">
                     <span class="card-rank">#{idx}</span>
@@ -986,15 +1253,108 @@ def generate_html_report(programs_with_evals, output_path, model_name):
             </div>
 
             <div class="card-meta-grid">
-                <div class="meta-item"><strong>Access:</strong> {vis_icon} {p.get('visibility', 'Public')}</div>
+                <div class="meta-item"><strong>Launched Date:</strong> <span class="highlight-text">{p.get('launched_at', 'N/A')}</span></div>
                 <div class="meta-item"><strong>Reward:</strong> <code>{p['reward']}</code></div>
-                <div class="meta-item"><strong>Launched:</strong> {p.get('launched_at', 'N/A')}</div>
-                <div class="meta-item"><strong>Last Updated:</strong> {p.get('last_updated_at', 'N/A')}</div>
+                <div class="meta-item"><strong>Access:</strong> {vis_icon} {p.get('visibility', 'Public')}</div>
                 <div class="meta-item"><strong>Program Link:</strong> <a href="{p['url']}" target="_blank">{p['url']}</a></div>
             </div>
 
             {stats_html}
-            {access_html}
+
+            <div class="checklist-container">
+                <h4>7-Point IDOR Screening Checklist:</h4>
+                <ul class="checklist">
+                    {checklist_html}
+                </ul>
+            </div>
+
+            {scopes_html}
+        </div>
+        """)
+
+    # 2. Build Updated Table Rows & Cards
+    updated_rows = []
+    updated_cards = []
+    for idx, item in enumerate(by_updated, 1):
+        p = item["prog"]
+        score = item["score"]
+        score_class = "score-high" if score >= 5 else ("score-med" if score >= 3 else "score-low")
+        platform_class = f"badge-{p['platform'].lower()}"
+        type_class = "badge-bounty" if p["type"] == "Bounty" else "badge-vdp"
+        vis_class = "badge-private" if p.get("visibility") == "Private" else "badge-public"
+        vis_icon = "🔒" if p.get("visibility") == "Private" else "🌐"
+
+        scope_up_pill = '<span class="badge-scope-up">🟢 Scopes Updated</span>' if p.get("scope_updated") else '<span class="badge-scope-same">⚪ Policy Only</span>'
+
+        updated_rows.append(f"""
+        <tr data-platform="{p['platform'].lower()}" data-type="{p['type'].lower()}" data-visibility="{p.get('visibility', 'public').lower()}">
+            <td class="text-center"><strong>#{idx}</strong></td>
+            <td><span class="badge {platform_class}">{p['platform']}</span></td>
+            <td><a href="#card-update-{idx}" class="program-link">{p['name']}</a></td>
+            <td><span class="badge {type_class}">{p['type']}</span></td>
+            <td><span class="badge {vis_class}">{vis_icon} {p.get('visibility', 'Public')}</span></td>
+            <td><code>{p['reward']}</code></td>
+            <td class="highlight-date"><strong>{p.get('last_updated_at', 'N/A')}</strong></td>
+            <td class="text-center">{scope_up_pill}</td>
+            <td class="text-center"><span class="score-pill {score_class}">{score}/7</span></td>
+            <td class="text-center"><a href="{p['url']}" target="_blank" class="btn-external">Policy ↗</a></td>
+        </tr>
+        """)
+
+        # Separated list of updated scopes
+        updated_scopes = p.get("updated_scopes", [])
+        if updated_scopes:
+            up_items_html = []
+            for us in updated_scopes[:15]:
+                up_items_html.append(f'<li><span class="badge-new-dot">●</span> <span class="target-name">{us["target"]}</span> <span class="badge-type">[{us["type"]}]</span></li>')
+            if len(updated_scopes) > 15:
+                up_items_html.append(f'<li class="text-muted">... and {len(updated_scopes) - 15} more updated assets</li>')
+
+            updated_box_html = f"""
+            <div class="updated-scopes-box">
+                <div class="updated-scopes-title">
+                    <span>🔄 Newly Updated Scope Assets in This Release ({len(updated_scopes)} items)</span>
+                </div>
+                <ul class="updated-scopes-list">
+                    {''.join(up_items_html)}
+                </ul>
+            </div>
+            """
+        else:
+            updated_box_html = """
+            <div class="updated-scopes-box unchanged">
+                <span>ℹ️ <strong>Scope Unchanged in Latest Release:</strong> This update adjusted rules, rewards, or briefing details without modifying in-scope targets.</span>
+            </div>
+            """
+
+        checklist_html = render_checklist_html(item["eval"])
+        scopes_html = render_scopes_accordion(p.get("valid_in_scope", []))
+        stats_html = f'<div class="meta-item"><strong>Platform Health:</strong> {p.get("stats")}</div>' if p.get("stats") else ""
+
+        updated_cards.append(f"""
+        <div class="card" id="card-update-{idx}" data-platform="{p['platform'].lower()}" data-type="{p['type'].lower()}" data-visibility="{p.get('visibility', 'public').lower()}">
+            <div class="card-header">
+                <div class="card-title-group">
+                    <span class="card-rank">#{idx}</span>
+                    <h3 class="card-title">{p['name']}</h3>
+                    <span class="badge {platform_class}">{p['platform']}</span>
+                    <span class="badge {type_class}">{p['type']}</span>
+                    <span class="badge {vis_class}">{vis_icon} {p.get('visibility', 'Public')}</span>
+                </div>
+                <div class="card-score-pill">
+                    <span class="score-pill {score_class}">{score}/7 IDOR Viability</span>
+                </div>
+            </div>
+
+            <div class="card-meta-grid">
+                <div class="meta-item"><strong>Last Updated:</strong> <span class="highlight-text">{p.get('last_updated_at', 'N/A')}</span></div>
+                <div class="meta-item"><strong>Original Launch:</strong> {p.get('launched_at', 'N/A')}</div>
+                <div class="meta-item"><strong>Reward:</strong> <code>{p['reward']}</code></div>
+                <div class="meta-item"><strong>Program Link:</strong> <a href="{p['url']}" target="_blank">{p['url']}</a></div>
+            </div>
+
+            {updated_box_html}
+            {stats_html}
 
             <div class="checklist-container">
                 <h4>7-Point IDOR Screening Checklist:</h4>
@@ -1012,7 +1372,7 @@ def generate_html_report(programs_with_evals, output_path, model_name):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bug Bounty IDOR Target Reconnaissance Report</title>
+    <title>Bug Bounty Target Reconnaissance & IDOR Screening</title>
     <style>
         :root {{
             --bg-main: #0b0f19;
@@ -1041,7 +1401,7 @@ def generate_html_report(programs_with_evals, output_path, model_name):
         }}
 
         .container {{
-            max-width: 1200px;
+            max-width: 1280px;
             margin: 0 auto;
         }}
 
@@ -1089,6 +1449,37 @@ def generate_html_report(programs_with_evals, output_path, model_name):
             letter-spacing: 0.05em;
         }}
 
+        /* Section Mode Switcher */
+        .section-switcher {{
+            display: flex;
+            gap: 0.8rem;
+            margin-bottom: 1.5rem;
+            border-bottom: 2px solid var(--border-color);
+            padding-bottom: 0.8rem;
+        }}
+        .section-tab-btn {{
+            background: transparent;
+            border: 2px solid transparent;
+            color: var(--text-muted);
+            font-size: 1.05rem;
+            font-weight: 700;
+            padding: 0.6rem 1.4rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }}
+        .section-tab-btn:hover {{
+            color: var(--primary);
+            background-color: rgba(56, 189, 248, 0.08);
+        }}
+        .section-tab-btn.active {{
+            background-color: var(--primary);
+            color: #0b0f19;
+            font-weight: 800;
+            box-shadow: 0 0 15px var(--primary-glow);
+        }}
+
+        /* Sub Filter Bar */
         .filter-bar {{
             display: flex;
             flex-wrap: wrap;
@@ -1116,6 +1507,7 @@ def generate_html_report(programs_with_evals, output_path, model_name):
             font-weight: 600;
         }}
 
+        /* Table */
         .table-responsive {{
             overflow-x: auto;
             background-color: var(--bg-card);
@@ -1145,7 +1537,10 @@ def generate_html_report(programs_with_evals, output_path, model_name):
         }}
         .text-center {{ text-align: center; }}
         .text-muted {{ color: var(--text-muted); }}
+        .highlight-date {{ color: #38bdf8; font-weight: 600; }}
+        .highlight-text {{ color: #38bdf8; font-weight: 700; }}
 
+        /* Badges */
         .badge {{
             display: inline-block;
             padding: 0.2rem 0.55rem;
@@ -1161,6 +1556,10 @@ def generate_html_report(programs_with_evals, output_path, model_name):
         .badge-vdp {{ background: rgba(148, 163, 184, 0.15); color: #cbd5e1; }}
         .badge-private {{ background: rgba(168, 85, 247, 0.2); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.4); }}
         .badge-public {{ background: rgba(56, 189, 248, 0.15); color: #38bdf8; }}
+        .badge-scope-up {{ background: rgba(16, 185, 129, 0.2); color: #34d399; font-weight: 700; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.75rem; }}
+        .badge-scope-same {{ color: var(--text-muted); font-size: 0.75rem; }}
+        .badge-type {{ color: #38bdf8; font-weight: 600; font-size: 0.75rem; }}
+        .badge-new-dot {{ color: #10b981; font-size: 0.8rem; margin-right: 0.3rem; }}
 
         .score-pill {{
             display: inline-block;
@@ -1189,6 +1588,7 @@ def generate_html_report(programs_with_evals, output_path, model_name):
         }}
         .btn-external:hover {{ background-color: var(--primary-glow); }}
 
+        /* Cards */
         .card {{
             background-color: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -1236,6 +1636,41 @@ def generate_html_report(programs_with_evals, output_path, model_name):
             margin-bottom: 1rem;
         }}
         .meta-item a {{ color: var(--primary); text-decoration: none; }}
+
+        /* Dedicated Updated Scope Callout Box */
+        .updated-scopes-box {{
+            background-color: rgba(16, 185, 129, 0.08);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1.2rem;
+        }}
+        .updated-scopes-box.unchanged {{
+            background-color: rgba(148, 163, 184, 0.05);
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }}
+        .updated-scopes-title {{
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #34d399;
+            margin-bottom: 0.6rem;
+        }}
+        .updated-scopes-list {{
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0.4rem;
+            font-family: monospace;
+            font-size: 0.85rem;
+        }}
+        .updated-scopes-list li {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+
         .checklist-container {{
             margin: 1.2rem 0;
         }}
@@ -1271,6 +1706,7 @@ def generate_html_report(programs_with_evals, output_path, model_name):
         .item-checked {{ border-left: 3px solid var(--success); }}
         .item-pending {{ border-left: 3px solid var(--border-color); opacity: 0.85; }}
 
+        /* Scope Accordion */
         .scopes-accordion {{
             margin-top: 1rem;
             background-color: rgba(11, 15, 25, 0.6);
@@ -1304,14 +1740,15 @@ def generate_html_report(programs_with_evals, output_path, model_name):
         @media (max-width: 768px) {{
             .card-header {{ flex-direction: column; align-items: flex-start; }}
             .card-meta-grid {{ grid-template-columns: 1fr; }}
+            .section-switcher {{ flex-direction: column; }}
         }}
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🎯 Bug Bounty IDOR Target Reconnaissance</h1>
-            <p class="header-meta">Generated on <strong>{now_str}</strong> • Evaluated with <strong>{model_name}</strong> • Filtered for IDOR Hunting</p>
+            <h1>🎯 Bug Bounty Target Reconnaissance & IDOR Screening</h1>
+            <p class="header-meta">Generated on <strong>{now_str}</strong> • Evaluated with <strong>{model_name}</strong> • Dual-Section (Launch & Update Views)</p>
         </header>
 
         <div class="stats-grid">
@@ -1333,43 +1770,92 @@ def generate_html_report(programs_with_evals, output_path, model_name):
             </div>
         </div>
 
-        <div class="filter-bar">
-            <button class="filter-btn active" onclick="filterTargets('all', event)">All Programs ({total_progs})</button>
-            <button class="filter-btn" onclick="filterTargets('private', event)">🔒 Private Only ({private_count})</button>
-            <button class="filter-btn" onclick="filterTargets('public', event)">🌐 Public Only ({public_count})</button>
-            <button class="filter-btn" onclick="filterTargets('hackerone', event)">HackerOne</button>
-            <button class="filter-btn" onclick="filterTargets('bugcrowd', event)">Bugcrowd</button>
-            <button class="filter-btn" onclick="filterTargets('yeswehack', event)">YesWeHack</button>
-            <button class="filter-btn" onclick="filterTargets('bounty', event)">Bounties Only</button>
-            <button class="filter-btn" onclick="filterTargets('vdp', event)">VDP Only</button>
+        <!-- Section Switcher Tabs -->
+        <div class="section-switcher">
+            <button class="section-tab-btn active" onclick="switchSection('launched', event)">🚀 Newly Launched Programs ({len(by_launched)})</button>
+            <button class="section-tab-btn" onclick="switchSection('updated', event)">🔄 Recently Updated Programs ({len(by_updated)})</button>
         </div>
 
-        <div class="table-responsive">
-            <table>
-                <thead>
-                    <tr>
-                        <th class="text-center">Rank</th>
-                        <th>Platform</th>
-                        <th>Program</th>
-                        <th>Type</th>
-                        <th>Access</th>
-                        <th>Reward</th>
-                        <th>Launched</th>
-                        <th>Last Updated</th>
-                        <th class="text-center">IDOR Score</th>
-                        <th class="text-center">Action</th>
-                    </tr>
-                </thead>
-                <tbody id="matrix-tbody">
-                    {''.join(table_rows)}
-                </tbody>
-            </table>
+        <!-- SECTION 1: NEWLY LAUNCHED -->
+        <div id="section-launched">
+            <div class="filter-bar">
+                <button class="filter-btn active" onclick="filterSectionTargets('section-launched', 'all', event)">All ({len(by_launched)})</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'private', event)">🔒 Private</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'public', event)">🌐 Public</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'hackerone', event)">HackerOne</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'bugcrowd', event)">Bugcrowd</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'yeswehack', event)">YesWeHack</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'bounty', event)">Bounties</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-launched', 'vdp', event)">VDPs</button>
+            </div>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th class="text-center">Rank</th>
+                            <th>Platform</th>
+                            <th>Program</th>
+                            <th>Type</th>
+                            <th>Access</th>
+                            <th>Reward</th>
+                            <th>Launched Date</th>
+                            <th class="text-center">IDOR Score</th>
+                            <th class="text-center">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody class="matrix-tbody">
+                        {''.join(launched_rows)}
+                    </tbody>
+                </table>
+            </div>
+
+            <section class="cards-section">
+                <h2 style="margin-bottom: 1.2rem; font-size: 1.4rem; font-weight: 700;">Newly Launched Program Details (Valid Scopes)</h2>
+                {''.join(launched_cards)}
+            </section>
         </div>
 
-        <section id="cards-section">
-            <h2 style="margin-bottom: 1.2rem; font-size: 1.5rem; font-weight: 700;">Detailed Program Findings</h2>
-            {''.join(cards_html)}
-        </section>
+        <!-- SECTION 2: RECENTLY UPDATED -->
+        <div id="section-updated" style="display: none;">
+            <div class="filter-bar">
+                <button class="filter-btn active" onclick="filterSectionTargets('section-updated', 'all', event)">All ({len(by_updated)})</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'private', event)">🔒 Private</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'public', event)">🌐 Public</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'hackerone', event)">HackerOne</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'bugcrowd', event)">Bugcrowd</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'yeswehack', event)">YesWeHack</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'bounty', event)">Bounties</button>
+                <button class="filter-btn" onclick="filterSectionTargets('section-updated', 'vdp', event)">VDPs</button>
+            </div>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th class="text-center">Rank</th>
+                            <th>Platform</th>
+                            <th>Program</th>
+                            <th>Type</th>
+                            <th>Access</th>
+                            <th>Reward</th>
+                            <th>Last Updated</th>
+                            <th class="text-center">Scope Status</th>
+                            <th class="text-center">IDOR Score</th>
+                            <th class="text-center">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody class="matrix-tbody">
+                        {''.join(updated_rows)}
+                    </tbody>
+                </table>
+            </div>
+
+            <section class="cards-section">
+                <h2 style="margin-bottom: 1.2rem; font-size: 1.4rem; font-weight: 700;">Recently Updated Program Details (With Separated Updated Scopes)</h2>
+                {''.join(updated_cards)}
+            </section>
+        </div>
 
         <footer>
             <p>BountyTargetScout • Automated Reconnaissance & IDOR Screening</p>
@@ -1377,15 +1863,35 @@ def generate_html_report(programs_with_evals, output_path, model_name):
     </div>
 
     <script>
-        function filterTargets(filter, evt) {{
+        function switchSection(sec, evt) {{
             const ev = evt || window.event;
-            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.section-tab-btn').forEach(btn => btn.classList.remove('active'));
             if (ev && ev.target) {{
                 ev.target.classList.add('active');
             }}
 
-            const rows = document.querySelectorAll('#matrix-tbody tr');
-            const cards = document.querySelectorAll('.card');
+            const secLaunch = document.getElementById('section-launched');
+            const secUpdate = document.getElementById('section-updated');
+
+            if (sec === 'launched') {{
+                secLaunch.style.display = 'block';
+                secUpdate.style.display = 'none';
+            }} else {{
+                secLaunch.style.display = 'none';
+                secUpdate.style.display = 'block';
+            }}
+        }}
+
+        function filterSectionTargets(sectionId, filter, evt) {{
+            const ev = evt || window.event;
+            const container = document.getElementById(sectionId);
+            container.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
+            if (ev && ev.target) {{
+                ev.target.classList.add('active');
+            }}
+
+            const rows = container.querySelectorAll('.matrix-tbody tr');
+            const cards = container.querySelectorAll('.card');
 
             rows.forEach(row => {{
                 const platform = row.getAttribute('data-platform');
@@ -1480,24 +1986,10 @@ def main():
     all_programs.extend(h1_vdp + h1_bounty)
 
     print(f"\n[*] Total targets extracted: {len(all_programs)}")
-
-    # 2. Sort all programs chronologically by recency (newest launch/update first, private invites prioritized)
-    all_programs.sort(
-        key=lambda p: (
-            p.get("visibility") == "Private",  # Prioritize private invites
-            max(
-                parse_timestamp_for_sort(p.get("last_updated_at")),
-                parse_timestamp_for_sort(p.get("launched_at")),
-            )
-        ),
-        reverse=True,
-    )
-
-    print("[*] Programs ranked chronologically (Private programs prioritized).")
     print("[*] Beginning parallel LLM evaluation of 7 IDOR criteria...\n")
 
-    # 3. Evaluate with LLM in parallel
-    evaluated_results = [None] * len(all_programs)
+    # 2. Evaluate with LLM in parallel
+    evaluated_results: list = [None] * len(all_programs)
 
     def worker(item):
         idx, prog = item
@@ -1505,14 +1997,14 @@ def main():
         print(f"[*] [{idx}/{len(all_programs)}] Evaluating [{prog['platform']}] {prog['name']} ({prog['type']} {vis_tag})...")
         eval_text = evaluate_program_with_llm(client, model, prog)
         score = calculate_score(eval_text)
-        print(f"[+] [{idx}/{len(all_programs)}] Done [{prog['platform']}] {prog['name']} -> Score: {score}/7 (Launched: {prog.get('launched_at')})")
+        print(f"[+] [{idx}/{len(all_programs)}] Done [{prog['platform']}] {prog['name']} -> Score: {score}/7 (Launched: {prog.get('launched_at')} | Updated: {prog.get('last_updated_at')})")
         return idx - 1, {"prog": prog, "eval": eval_text, "score": score}
 
     with ThreadPoolExecutor(max_workers=4) as executor:
         for pos, res in executor.map(worker, enumerate(all_programs, 1)):
             evaluated_results[pos] = res
 
-    # 4. Generate Reports
+    # 3. Generate Reports with Dual Sections
     base_name = args.output
     if base_name.endswith(".md") or base_name.endswith(".html"):
         base_name = os.path.splitext(base_name)[0]
